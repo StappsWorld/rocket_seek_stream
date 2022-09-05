@@ -1,11 +1,8 @@
 #![allow(unused_must_use)]
 
 use crate::multipart::MultipartReader;
-use futures::executor::block_on;
-use rocket::futures;
 use rocket::response::{self, Responder, Response};
 use rocket::tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
-use rocket::tokio::runtime::Handle;
 use std::cell::RefCell;
 use std::path::Path;
 use std::pin::Pin;
@@ -27,28 +24,22 @@ fn infer_mime_type(prelude: &[u8]) -> String {
 /// The Accept Ranges header will always be set.
 /// If a range request is received, it will respond with the requested offset.
 /// Multipart range requests are also supported.
-pub struct SeekStream<'a> {
+pub struct SeekStream {
     stream: RefCell<Pin<Box<dyn ReadSeek>>>,
     length: Option<u64>,
-    content_type: Option<&'a str>,
+    content_type: Option<String>,
 }
 
-impl<'a> SeekStream<'a> {
-    pub fn new<T>(s: T) -> SeekStream<'a>
-    where
-        T: AsyncRead + AsyncSeek + Send + 'static,
-    {
+impl SeekStream {
+    pub fn new<T: AsyncRead + AsyncSeek + Send + 'static>(s: T) -> Self {
         Self::with_opts(s, None, None)
     }
 
-    pub fn with_opts<T>(
+    pub fn with_opts<T: AsyncRead + AsyncSeek + Send + 'static>(
         stream: T,
         stream_len: impl Into<Option<u64>>,
-        content_type: impl Into<Option<&'a str>>,
-    ) -> SeekStream<'a>
-    where
-        T: AsyncRead + AsyncSeek + Send + 'static,
-    {
+        content_type: impl Into<Option<String>>,
+    ) -> Self {
         SeekStream {
             stream: RefCell::new(Box::pin(stream)),
             length: stream_len.into(),
@@ -58,58 +49,22 @@ impl<'a> SeekStream<'a> {
 
     /// Serve content from a file path. The mime type will be inferred by taking a sample from
     /// The beginning of the stream.
-    pub fn from_path<T: AsRef<Path>>(p: T) -> std::io::Result<Self> {
-        let handle = Handle::current();
-        handle.enter();
-        let file = match block_on(rocket::tokio::fs::File::open(p.as_ref())) {
+    pub async fn from_path<T: AsRef<Path>>(p: T) -> std::io::Result<Self> {
+        let file = match rocket::tokio::fs::File::open(p.as_ref()).await {
             Ok(f) => f,
             Err(e) => return Err(e),
         };
-        let len = block_on(file.metadata()).unwrap().len();
+        let len = file.metadata().await.unwrap().len();
 
         Ok(Self::with_opts(file, len, None))
     }
-}
 
-// Convert a range to a satisfiable range
-fn to_satisfiable_range(
-    from: Option<u64>,
-    to: Option<u64>,
-    length: u64,
-) -> Result<(u64, u64), &'static str> {
-    let (start, mut end) = match (from, to) {
-        (Some(x), Some(z)) => (x, z),                // FromToAll
-        (Some(x), None) => (x, length - 1),          // FromTo
-        (None, Some(z)) => (length - z, length - 1), // FromEnd
-        (None, None) => return Err("You need at least one value to satisfy a range request"),
-    };
-
-    if end < start {
-        return Err("A byte-range-spec is invalid if the last-byte-pos value is present and less than the first-byte-pos.");
-    }
-    if end > length {
-        end = length
-    }
-
-    Ok((start, end))
-}
-
-fn range_header_parts(header: &range_header::ByteRange) -> (Option<u64>, Option<u64>) {
-    use range_header::ByteRange::{FromTo, FromToAll, Last};
-    match *header {
-        FromTo(x) => (Some(x), None),
-        FromToAll(x, y) => (Some(x), Some(y)),
-        Last(x) => (None, Some(x)),
-    }
-}
-
-#[rocket::async_trait]
-impl<'r> Responder<'r, 'static> for SeekStream<'r> {
-    fn respond_to(self, req: &'r rocket::Request) -> response::Result<'static> {
+    pub async fn get_response<'r>(
+        self,
+        headers: &rocket::http::HeaderMap<'r>,
+    ) -> response::Result<'static> {
         use rocket::http::Status;
         use std::io::SeekFrom;
-        let handle = Handle::current();
-        handle.enter();
 
         const SERVER_ERROR: Status = Status::InternalServerError;
         const RANGE_ERROR: Status = Status::RangeNotSatisfiable;
@@ -119,15 +74,15 @@ impl<'r> Responder<'r, 'static> for SeekStream<'r> {
             Some(x) => x,
             _ => {
                 let mut borrowed = self.stream.borrow_mut();
-                let old_pos = match block_on(borrowed.seek(SeekFrom::Current(0))) {
+                let old_pos = match borrowed.seek(SeekFrom::Current(0)).await {
                     Ok(x) => x,
                     Err(_) => return Err(SERVER_ERROR),
                 };
-                let len = match block_on(borrowed.seek(SeekFrom::End(0))) {
+                let len = match borrowed.seek(SeekFrom::End(0)).await {
                     Ok(x) => x,
                     Err(_) => return Err(SERVER_ERROR),
                 };
-                match block_on(borrowed.seek(SeekFrom::Start(old_pos))) {
+                match borrowed.seek(SeekFrom::Start(old_pos)).await {
                     Ok(_) => len,
                     Err(_) => return Err(SERVER_ERROR),
                 }
@@ -137,17 +92,24 @@ impl<'r> Responder<'r, 'static> for SeekStream<'r> {
         // Get the mime type, either by inferring it from the stream
         // Or the optional value set in the struct
         let mime_type = match self.content_type {
-            Some(x) => String::from(x),
+            Some(x) => x,
             None => {
                 // Infer the mime type of the stream by taking at most a 256 byte sample from the beginning
                 // And passing it to the infer_mime_type function
                 let mut prelude: [u8; 256] = [0; 256];
 
-                let c = block_on(self.stream.borrow_mut().read(&mut prelude))
+                let c = self
+                    .stream
+                    .borrow_mut()
+                    .read(&mut prelude)
+                    .await
                     .map_err(|_| SERVER_ERROR)?;
 
                 // Seek to the beginning of the stream to reset the data we took for the sample
-                block_on(self.stream.borrow_mut().seek(std::io::SeekFrom::Start(0)))
+                self.stream
+                    .borrow_mut()
+                    .seek(std::io::SeekFrom::Start(0))
+                    .await
                     .map_err(|_| SERVER_ERROR)?;
 
                 infer_mime_type(&prelude[..c])
@@ -161,7 +123,7 @@ impl<'r> Responder<'r, 'static> for SeekStream<'r> {
 
         // If the range header exists, set the response status code to
         // 206 partial content and seek the stream to the requested position
-        if let Some(x) = req.headers().get_one("Range") {
+        if let Some(x) = headers.get_one("Range") {
             let (ranges, errors) = range_header::ByteRange::parse(x)
                 .iter()
                 .map(|x| range_header_parts(&x))
@@ -204,7 +166,11 @@ impl<'r> Responder<'r, 'static> for SeekStream<'r> {
                 let &(start, end) = ranges.get(0).unwrap();
 
                 // Seek the stream to the desired position
-                match block_on(self.stream.borrow_mut().seek(SeekFrom::Start(start)))
+                match self
+                    .stream
+                    .borrow_mut()
+                    .seek(SeekFrom::Start(start))
+                    .await
                     .map_err(|_| SERVER_ERROR)
                 {
                     Ok(_) => (),
@@ -234,5 +200,45 @@ impl<'r> Responder<'r, 'static> for SeekStream<'r> {
         }
 
         Ok(resp)
+    }
+}
+
+// Convert a range to a satisfiable range
+fn to_satisfiable_range(
+    from: Option<u64>,
+    to: Option<u64>,
+    length: u64,
+) -> Result<(u64, u64), &'static str> {
+    let (start, mut end) = match (from, to) {
+        (Some(x), Some(z)) => (x, z),                // FromToAll
+        (Some(x), None) => (x, length - 1),          // FromTo
+        (None, Some(z)) => (length - z, length - 1), // FromEnd
+        (None, None) => return Err("You need at least one value to satisfy a range request"),
+    };
+
+    if end < start {
+        return Err("A byte-range-spec is invalid if the last-byte-pos value is present and less than the first-byte-pos.");
+    }
+    if end > length {
+        end = length
+    }
+
+    Ok((start, end))
+}
+
+fn range_header_parts(header: &range_header::ByteRange) -> (Option<u64>, Option<u64>) {
+    use range_header::ByteRange::{FromTo, FromToAll, Last};
+    match *header {
+        FromTo(x) => (Some(x), None),
+        FromToAll(x, y) => (Some(x), Some(y)),
+        Last(x) => (None, Some(x)),
+    }
+}
+
+impl<'r> Responder<'r, 'static> for SeekStream {
+    fn respond_to(self, req: &'r rocket::Request) -> response::Result<'static> {
+        let handle = rocket::tokio::runtime::Handle::current();
+        handle.enter();
+        futures::executor::block_on(self.get_response(req.headers()))
     }
 }
